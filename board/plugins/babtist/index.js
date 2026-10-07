@@ -97,7 +97,8 @@ function rotFraga(handelser, e) {
 function status(handelser, fraga) {
   const kedja = handelser.filter((e) => e.id > fraga.id && rotFraga(handelser, e)?.id === fraga.id);
   if (kedja.some((e) => e.typ === 'svar.klart')) return 'klar';
-  if (kedja.some((e) => e.styrka !== null && e.styrka >= 60 && ['minne.träff', 'svar.utkast', 'svar.granskat'].includes(e.typ))) return 'på väg';
+  if (kedja.some((e) => e.typ === 'sammanfattning.klar'
+    || (e.styrka !== null && e.styrka >= 60 && ['minne.träff', 'svar.utkast', 'svar.granskat'].includes(e.typ)))) return 'på väg';
   return 'tyst';
 }
 
@@ -172,9 +173,11 @@ module.exports = {
     const handelser = ctx.board.events(300);
     const fraga = rotFraga(handelser, e);
     if (!fraga) return;
-    // Underkänt svar men Minnet är säkert: lita på Minnet och låt timern avgöra, i stället för att lotsa direkt.
-    if (e.typ === 'svar.granskat' && handelser.some((x) => x.typ === 'minne.träff' && x.styrka !== null
-      && x.styrka >= 70 && rotFraga(handelser, x)?.id === fraga.id)) return;
+    // Frågor som Mötet eller Översättaren äger: Minnet vet inget, men förmågan svarar. Låt timern avgöra.
+    if (e.typ === 'minne.träff' && UPPDRAG.some(([re]) => re.test(String(fraga.nyttolast?.fråga || '').toLowerCase()))) return;
+    // Underkänt svar men Minnet är säkert eller Mötet har sammanfattat: låt timern avgöra, i stället för att lotsa direkt.
+    if (e.typ === 'svar.granskat' && handelser.some((x) => rotFraga(handelser, x)?.id === fraga.id
+      && (x.typ === 'sammanfattning.klar' || (x.typ === 'minne.träff' && x.styrka !== null && x.styrka >= 70)))) return;
     lotsa(ctx, fraga, e.typ);
   },
 };
