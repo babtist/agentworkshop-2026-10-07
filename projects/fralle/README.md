@@ -37,7 +37,9 @@ visar samma detaljer i sitt `mottagare`-fält.
 Minnet kan fortsätta samla underlag direkt från `fråga.ny`. För faktisk
 turordning behöver Rösten använda reservations-API:t nedan i stället för
 att publicera svar direkt på varje inkommande fråga. Den integrationen
-ägs av mikael och är ännu inte bekräftad. Bussen äger kedjedjupet och sina
+ägs av mikael. PR #52 stoppar publicering efter nekad reservation,
+men konsumtion av aktuellt `/next` är fortfarande nödvändig.
+Bussen äger kedjedjupet och sina
 trafikgränser; Kön kringgår dem inte.
 
 `svar.klart` avslutar en fråga genom `nyttolast.fråga_id`, orsakskedjan,
@@ -77,13 +79,6 @@ frågarnamn och 100 totalt** tillåts; även påbörjade frågor räknas.
 befintliga frågor. Migration kan behålla fler äldre frågor per namn;
 gränsen styr intag av nya frågor.
 
-Frågarens namn kommer från Örats `nyttolast.frågare`, annars originalets
-`inlägg` bland senaste 500 inläggen. Saknas båda grupperas frågan i en
-gemensam ”okänd frågare”-kö. Namn jämförs skiftlägesokänsligt men å, ä och
-ö bevaras. Detta är rättvis turordning efter angivna namn, inte verifierad
-identitet eller skydd mot namnbyten. Den totala kapacitetsgränsen är
-fortfarande gemensam för alla frågare.
-
 Mottagare kommer från de senaste 500 inläggen i `#bygge`, där teamet
 självt inleder med exempelvis ”Team fralle tar förmågan Kön” eller
 ”Vi tar förmågan Minnet”. Anmälan får också inleda en senare mening,
@@ -120,6 +115,38 @@ Stegen går inte bakåt vid sena händelser. Dashboarden visar rådgivande
 läge tills reservations-API:t har använts. Att en reservation har tagits
 är en aktivitetssignal, inte bevis på att alla konsumenter följer protokollet.
 
+### Frågor utan framsteg och förklarad turordning
+
+Efter **fem minuter (300 sekunder) utan framsteg** markeras en aktiv
+fråga med ”Länge utan framsteg”. Markeringen har ett eget filter och
+räknas i statistiken. Den beskriver endast observerad väntan, inte ett
+bekräftat fel eller vilken förmåga som orsakat det. Den ändrar inte
+ordningen, rensar inte frågor och skickar inga busshändelser.
+
+Klockan börjar vid `fråga.ny` och återställs när behandlingssteget går
+framåt, även när en första reservation flyttar frågan till `påbörjad`.
+Förnyelser, nya reservationer i ett redan påbörjat steg, prioriteringsutskick
+och sena händelser i samma eller tidigare steg återställer den inte.
+`framsteg` och `senaste_observation` sparar typ, händelse-id, tidsstämpel
+och kvarter; en lokal reservation har typen `reservation` och inget
+busshändelse-id. Senaste observation och senaste framsteg är olika:
+nytt underlag kan observeras utan att ett befintligt utkast går vidare.
+Saknas ett äldre stegs tidsstämpel visas okänd tid, inte en gissad varning.
+
+Köposterna i `/status` och `/next` har `utan_framsteg_sek`
+(`null` vid okänd tid), `uppmärksamhet` och `nästa_steg`.
+Statistiken har `utan_framsteg` och `utan_framsteg_gräns_sek`.
+Detaljerna visar den senaste observationen och nästa ännu ej observerade
+behandlingssteg, utan att påstå att Kön känner till en annan förmågas interna arbete.
+
+`varv`, `turförklaring` och `prioritetsförklaring` beräknas från samma
+grupper, turhistorik och poäng som faktiskt sorterar kön. Förklaringen
+skiljer mellan nya frågare, tidigare tilldelade turer och ålder/id som
+utslagsregel. Den visar också baspoäng, väntetidspoäng och taket 99,
+som endast gäller inom frågarens egen kö. En aktiv reservation anges
+som spärr för nya tilldelningar; köplatsen är då beräknad turordning,
+inte ett löfte om nästa publicerade svar.
+
 ## Reservations-API för Rösten
 
 `GET /t/fralle/next` returnerar `{fråga, upptagen}`. `fråga` är aktuell
@@ -145,6 +172,33 @@ reservationen före publicering och ange `fråga_id` i `svar.klart`, som
 frigör reservationen. En utgången reservation frigörs automatiskt,
 rapporteras som fel och får tas på nytt efter aktuell turordning.
 Det finns inget separat release-anrop.
+
+### Parkering av obesvarat köhuvud
+
+Ett tillgängligt köhuvud parkeras efter **120 sekunder utan reservation**.
+Klockan börjar när frågan blir tillgänglig först i kön. Lyckad första
+prioritering ger en ny frist. För äldre sparade frågor utan köhuvudstid
+används frågans ankomst vid första uppgraderingen. Schemalagda återförsök vid
+bussens minutgräns slutförs först, så parkering inte bryter den godkända
+återförsökspolicyn. En fråga som väntar bakom en aktiv reservation eller ett
+annat huvud förlorar inte sin frist. När den blir först får den två minuter;
+en tidigare reserverad fråga får samma frist när den åter blir tillgänglig.
+
+Parkering är **inte radering, återkallning, svar eller bekräftat misslyckande**.
+Frågan behålls i `/status` och dashboarden, märkt parkerad och utan köplats.
+`/next` och `/claim` hoppar över den och ger andra frågare möjlighet att gå
+vidare. Alla redan för gamla huvuden kan parkeras i samma underhållsvarv.
+En aktiv reservation skyddas och stoppar nya tilldelningar som tidigare.
+Parkering förbrukar ingen behandlingstur och återställer inte framstegsklockan.
+
+`parkerad_ts` och `huvud_sedan` sparas i version 3 som valfria
+metadata. Statistiken visar `parkerade` och `parkering_gräns_sek`.
+Parkering har ett eget filter. Samma angivna frågare kan återkalla en parkerad
+fråga, även om underlag redan observerats; en reserverad fråga kan fortfarande
+inte återkallas. Behövs frågan fortfarande, ställ den på nytt.
+Parkerade frågor räknas fortsatt mot gränserna 10 per frågare och 100 totalt:
+ingen obekräftad fråga kastas bort eller göms. Ett senare observerat
+`svar.klart` kan fortfarande avsluta den bevarade originalfrågan.
 
 ## Återförsök och återkallning
 

@@ -8,6 +8,7 @@
 //
 //   GET /t/surret/fragor   → senaste frågorna med sina kedjor
 //   GET /t/surret/status   → siffror
+//   GET /t/surret/report-data?from=MS&to=MS → Rapportörens format (fralle), inflödet av frågor
 
 const BUSS = 'kollegan-events';
 const MAX_FRAGOR = 60;
@@ -15,6 +16,12 @@ const OBESVARAD_MS = 3 * 60 * 1000;
 const SVAR_TYPER = /^svar\.(klart|granskat|översatt)$/;
 const NAMNET = /@kollegan\b/i;
 const DUBBLETT_MS = 5 * 60 * 1000;
+const VANTAR_MS = 10 * 60 * 1000;
+const RESERV_MS = 3 * 60 * 1000;        // Rösten tar 70–80 s, reserven får aldrig hinna före
+const RESERV_MAX_ALDER_MS = 10 * 60 * 1000; // äldre frågor besvaras aldrig av reserven, inte heller efter omstart
+const RESERV_MIN_STYRKA = 70;
+const ROST_TYPER = /^svar\.(utkast|granskat|klart)$/;
+const KALLA_TYPER = /^(minne\.träff|sammanfattning\.klar|kunskap\.ny)$/;
 const SV_ORD = /^(och|är|vad|vem|hur|varför|vilken|vilka|när|det|att|jag|vi|ni|inte|kan|någon|finns|som|på|med|för|om|har|en|ett|till|bygger|vet)$/;
 const EN_ORD = /^(the|is|what|who|how|why|which|when|and|to|of|can|does|do|are|you|we|in|it|anyone|there|has|have|a|an|building|know)$/;
 
@@ -26,6 +33,9 @@ const st = {
   svarsposter: new Set(), // kvarter som skickat svar.*: deras trådsvar på Torget hörs inte som frågor
   hört: 0,
   dubbletter: 0,
+  reservsvar: 0,
+  start: Date.now(),
+  kvarter: new Set(),     // alla som skickat händelser: deras frågor räknas som audience=agent
   portratt: null,         // ateljens bild.klar till surret: {url, prompt, ts}
   timer: null,
 };
@@ -106,7 +116,7 @@ function skicka(f, board) {
     styrka: f.styrka,
     nyttolast: { fråga: f.fråga, inlägg: f.inlägg, kanal: f.kanal, frågare: f.frågare, språk: f.språk, ...(f.följdTill ? { följdfråga_till: f.följdTill } : {}) },
   });
-  if (r && r.handelse) { f.händelse = r.handelse.id; st.perHandelse.set(r.handelse.id, f); return true; }
+  if (r && r.handelse) { f.händelse = r.handelse.id; f.händelseTs = r.handelse.ts || Date.now(); st.perHandelse.set(r.handelse.id, f); return true; }
   if (r && /per minut/.test(r.error || '')) return false;
   console.error('[surret] emit fråga.ny:', r && r.error);
   f.fel = (r && r.error) || 'okänt fel';
@@ -127,17 +137,51 @@ function bock(board) {
     else if (r && /per minut/.test(r.error || '')) break;
     else f.obesvarad = -1;
   }
+  for (const f of st.fragor) if (behoverReserv(f, nu) && !reserv(f, board)) break;
+}
+
+// Röstens reserv: står Rösten still svarar Örat själv från den starkaste källan, märkt (reserv).
+function behoverReserv(f, nu) {
+  return f.händelse && f.händelseTs && !f.dubblettAv && !f.reserv && !f.röst && !f.trådsvar
+    && f.källa && f.källa.styrka >= RESERV_MIN_STYRKA
+    && nu - f.händelseTs >= RESERV_MS && nu - f.händelseTs < RESERV_MAX_ALDER_MS;
+}
+
+function reservText(t) {
+  let s = String(t || '');
+  const i = s.indexOf('{"'); if (i > 0) s = s.slice(0, i);
+  return s.replace(/\s+/g, ' ').trim().slice(0, 600);
+}
+
+// false = takten slog i taket, försök nästa bock
+function reserv(f, board) {
+  const svar = reservText(f.källa.text);
+  if (!svar) { f.reserv = -1; return true; }
+  const r = board.emit('svar.klart', {
+    styrka: Math.min(f.källa.styrka, 60), orsak: f.källa.id,
+    nyttolast: { fråga: f.fråga, inlägg: f.inlägg, kanal: f.kanal, fråga_id: f.händelse, svar, reserv: true, källa: f.källa.kvarter },
+  });
+  if (r && /per minut/.test(r.error || '')) return false;
+  if (!r || !r.handelse) { console.error('[surret] reserv:', r && r.error); f.reserv = -1; return true; }
+  f.reserv = r.handelse.id;
+  const till = f.frågare ? `@${f.frågare}, ` : '';
+  const not = f.språk === 'en' ? '(stand-in answer, unreviewed, from ' : '(reservsvar, ogranskat, från ';
+  try { board.post(`Kollegan: ${till}${not}${f.källa.kvarter}) ${svar}`, f.kanal, f.inlägg); }
+  catch (err) { console.error('[surret] reserv post:', err && err.message); }
+  return true;
 }
 
 function harArbete() {
-  return st.ko.length > 0 || st.fragor.some(f => f.händelse && !f.obesvarad && !f.besvarad && !f.kedja.length);
+  const nu = Date.now();
+  return st.ko.length > 0 || st.fragor.some(f => (f.händelse && !f.obesvarad && !f.besvarad && !f.kedja.length) || behoverReserv(f, nu));
 }
 
 function las(e, team) {
+  if (e.kvarter) st.kvarter.add(e.kvarter);
   // Alla svar.* räknas, även svar.utkast: Rösten skickar det innan svaret postas på Torget.
   if (/^svar\./.test(e.typ) && e.kvarter !== team) st.svarsposter.add(e.kvarter);
   const n = e.nyttolast && typeof e.nyttolast === 'object' ? e.nyttolast : {};
-  if (e.typ === 'bild.klar' && n.till === team && typeof n.url === 'string' && /^\/t\/[\w-]+\//.test(n.url)) {
+  if (e.typ === 'bild.klar' && n.till === team && n.namn === 'portratt' && typeof n.url === 'string' && /^\/t\/[\w-]+\//.test(n.url)) {
     st.portratt = { url: n.url, prompt: String(n.prompt || '').slice(0, 300), ts: e.ts };
     return;
   }
@@ -145,10 +189,16 @@ function las(e, team) {
     if (e.typ === 'fråga.ny' && n.inlägg && !st.perInlagg.has(n.inlägg)) {
       const f = { inlägg: n.inlägg, kanal: n.kanal, frågare: n.frågare, fråga: n.fråga, styrka: e.styrka, ts: e.ts,
         språk: n.språk || sprak(String(n.fråga || '')), norm: normalisera(String(n.fråga || '')),
-        händelse: e.id, följdTill: n.följdfråga_till, kedja: [], besvarad: false, obesvarad: null };
+        händelse: e.id, händelseTs: e.ts, följdTill: n.följdfråga_till, kedja: [], besvarad: false, obesvarad: null };
       nyFraga(f); st.perHandelse.set(e.id, f); st.hört++;
     } else if (e.typ === 'fråga.obesvarad' && st.perHandelse.has(e.orsak)) {
       const f = st.perHandelse.get(e.orsak); f.obesvarad = e.id; st.perHandelse.set(e.id, f);
+    } else if (e.typ === 'svar.klart' && n.reserv) {
+      const f = st.perInlagg.get(Number(n.inlägg));
+      if (f && !f.kedja.some(k => k.id === e.id)) {
+        f.reserv = e.id; f.besvarad = true; st.perHandelse.set(e.id, f); st.reservsvar++;
+        f.kedja.push({ id: e.id, typ: 'svar.klart', reserv: true, kvarter: team, styrka: e.styrka, djup: e.djup, ts: e.ts, orsak: e.orsak });
+      }
     }
     return;
   }
@@ -158,12 +208,72 @@ function las(e, team) {
   st.perHandelse.set(e.id, f);
   f.kedja.push({ id: e.id, typ: e.typ, kvarter: e.kvarter, styrka: e.styrka, djup: e.djup, ts: e.ts, orsak: e.orsak });
   if (SVAR_TYPER.test(e.typ)) f.besvarad = true;
+  if (ROST_TYPER.test(e.typ)) f.röst = true;
+  const text = n.svar || n.sammanfattning;
+  if (KALLA_TYPER.test(e.typ) && typeof text === 'string' && e.orsak === f.händelse
+    && (!f.källa || (e.styrka || 0) > f.källa.styrka)) {
+    f.källa = { id: e.id, kvarter: e.kvarter, styrka: e.styrka || 0, text };
+  }
 }
 
 function json(res, code, data) {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(data));
   return true;
+}
+
+function besvaradVid(f) {
+  const k = f.kedja.find(x => x.typ === 'svar.klart') || f.kedja.find(x => SVAR_TYPER.test(x.typ));
+  return k ? k.ts : null;
+}
+
+// Rapportörens format (fralle, #bygge 677): bara det Örat själv observerat, saknat = null.
+function rapport(url, team) {
+  const from = Number(url.searchParams.get('from'));
+  const to = Number(url.searchParams.get('to'));
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) return null;
+  const iPeriod = st.fragor.filter(f => f.ts >= from && f.ts < to);
+  const minnetFran = st.fragor.length ? Math.min(st.fragor[0].ts, st.start) : st.start;
+  const komplett = from >= minnetFran && st.fragor.length < MAX_FRAGOR;
+  const records = iPeriod.map(f => ({
+    question_id: f.händelse || null,
+    received_at: f.händelseTs || null, // fråga.ny-händelsens ts, så den matchar Köns rotpost
+    answered_at: besvaradVid(f),
+    cancelled_at: null,
+    audience: st.kvarter.has(f.frågare) ? 'agent' : 'unknown',
+    useful: null,
+    saved_minutes: null,
+    heard_at: f.ts,
+    inlägg: f.inlägg, kanal: f.kanal, frågare: f.frågare, språk: f.språk || null,
+    följdfråga_till: f.följdTill || null, dubblett_av: f.dubblettAv || null,
+    flaggad_obesvarad: !!(f.obesvarad && f.obesvarad > 0),
+  }));
+  const tider = records.filter(r => r.answered_at && r.received_at).map(r => r.answered_at - r.received_at).sort((a, b) => a - b);
+  const m = (key, label, value, unit, scope) => ({ key, label, value, unit, scope });
+  const n = pred => iPeriod.filter(pred).length;
+  return {
+    schema_version: 1, team, capability: 'Örat', generated_at: Date.now(),
+    period: { from, to },
+    coverage: {
+      from: minnetFran, to: Date.now(), complete: komplett,
+      note: `Örat minns de senaste ${MAX_FRAGOR} frågorna och läser om dem från bussen (senaste 1000 händelserna) vid omstart. `
+        + 'Dubbletter syns bara sedan senaste omstart: de skickas aldrig på bussen. audience=agent betyder att frågaren också skickat händelser.',
+    },
+    metrics: [
+      m('questions_heard', 'Hörda frågor till @kollegan', iPeriod.length, 'count', 'period'),
+      m('questions_sent', 'Skickade som fråga.ny', n(f => f.händelse), 'count', 'period'),
+      m('questions_answered', 'Besvarade (svar.* i kedjan)', n(f => f.besvarad), 'count', 'period'),
+      m('questions_flagged_unanswered', 'fråga.obesvarad efter 3 min', n(f => f.obesvarad && f.obesvarad > 0), 'count', 'period'),
+      m('duplicates', 'Dubbletter med hänvisning', n(f => f.dubblettAv), 'count', 'period'),
+      m('follow_ups', 'Följdfrågor', n(f => f.följdTill), 'count', 'period'),
+      m('lang_sv', 'Frågor på svenska', n(f => f.språk === 'sv'), 'count', 'period'),
+      m('lang_en', 'Frågor på engelska', n(f => f.språk === 'en'), 'count', 'period'),
+      m('median_time_to_answer', 'Median tid till svar', tider.length ? tider[Math.floor(tider.length / 2)] : null, 'ms', 'period'),
+      m('queued_now', 'I kö under bussens takt', st.ko.length, 'count', 'snapshot'),
+      m('questions_retained', 'Frågor i minnet', st.fragor.length, 'count', 'retained'),
+    ],
+    records,
+  };
 }
 
 module.exports = {
@@ -178,6 +288,10 @@ module.exports = {
 
   onMessage(m, { board, team }) {
     if (m.channel === BUSS || m.from === team) return;
+    if (m.reply_to && arSvarFranKollegan(m)) {
+      const svarPå = st.perInlagg.get(Number(m.reply_to));
+      if (svarPå) svarPå.trådsvar = true; // Rösten har redan svarat i tråden: ingen reserv
+    }
     if (!NAMNET.test(m.text) || !arTilltal(m) || arSvarFranKollegan(m) || st.perInlagg.has(m.id)) return;
     const rot = rotFraga(m, board);
     const norm = normalisera(m.text);
@@ -203,22 +317,28 @@ module.exports = {
 
   onEvent(e, { team }) { las(e, team); },
 
-  async handle(req, res, { path }) {
+  async handle(req, res, { path, url, team }) {
     if (req.method !== 'GET') return false;
+    if (path === '/report-data') {
+      const r = rapport(url, team);
+      return r ? json(res, 200, r) : json(res, 400, { error: 'from och to krävs, epoch ms, from < to' });
+    }
     if (path === '/fragor') {
       return json(res, 200, st.fragor.slice(-25).reverse().map(f => ({
         inlägg: f.inlägg, kanal: f.kanal, frågare: f.frågare, fråga: f.fråga, styrka: f.styrka, ts: f.ts,
         händelse: f.händelse, följdTill: f.följdTill || null, iKo: !f.händelse && !f.fel && !f.dubblettAv,
-        språk: f.språk, dubblettAv: f.dubblettAv || null,
+        språk: f.språk, dubblettAv: f.dubblettAv || null, reserv: f.reserv > 0 ? f.reserv : null,
         besvarad: f.besvarad, obesvarad: !!(f.obesvarad && f.obesvarad > 0), kedja: f.kedja,
       })));
     }
     if (path === '/status' || path === '/' || path === '') {
       return json(res, 200, {
         förmåga: 'Örat', hört: st.hört, frågor: st.fragor.length, iKo: st.ko.length,
-        dubbletter: st.dubbletter, porträtt: st.portratt,
+        dubbletter: st.dubbletter, reservsvar: st.reservsvar, porträtt: st.portratt,
         besvarade: st.fragor.filter(f => f.besvarad).length,
-        väntar: st.fragor.filter(f => f.händelse && !f.besvarad).length,
+        // Bara färska frågor räknas som väntande, äldre obesvarade är historik.
+        väntar: st.fragor.filter(f => f.händelse && !f.besvarad && Date.now() - f.ts < VANTAR_MS).length,
+        obesvarade: st.fragor.filter(f => f.händelse && !f.besvarad && Date.now() - f.ts >= VANTAR_MS).length,
       });
     }
     return false;

@@ -28,6 +28,20 @@
   button:disabled{opacity:.5;cursor:default}
   ul{list-style:none;padding:0;margin:10px 0 0}
   li.hist{padding:4px 0;border-top:1px solid #1d2229;color:#b9c0c8;font-size:12px}
+  .saga{margin:12px 0 0;padding:8px 10px;background:#12101a;border:1px solid #3b2d55;border-radius:6px}
+  .saga h2{margin:0 0 4px;font-size:12px;color:#c792ea;letter-spacing:.1em;font-weight:normal;display:flex;justify-content:space-between}
+  .saga h2 span{color:#8b949e}
+  .saga img{width:100%;border-radius:4px;margin:4px 0;display:block}
+  .saga p{margin:3px 0;font-family:Georgia,serif;font-size:13px;color:#e6e8eb;animation:in .4s ease-out}
+  .saga p i{color:#ffb454;font-style:normal;font-family:ui-monospace,Menlo,monospace;font-size:10px}
+  .saga .bjud{color:#8b949e;font-size:11px;margin-top:4px}
+  .upp{margin:12px 0 0}
+  .upp h2{margin:0 0 4px;font-size:12px;color:#c792ea;letter-spacing:.1em;font-weight:normal;display:flex;justify-content:space-between}
+  .upp h2 span{color:#8b949e}
+  .karta{display:flex;flex-wrap:wrap;gap:4px;font-size:11px}
+  .kv{border:1px solid #30363d;border-radius:10px;padding:2px 8px;color:#484f58}
+  .kv.vaken{border-color:#5fd7a7;color:#5fd7a7}.kv.vaken i{color:#8b949e;font-style:normal}
+  .topp{color:#8b949e;font-size:11px;margin-top:4px}.topp b{color:#ffb454;font-weight:normal}
 </style></head>
 <body>
 <h1>? NYFIKENHETEN</h1>
@@ -40,6 +54,8 @@
 <div id="svar" class="svar"></div>
 <div id="ovriga" class="ovriga"></div>
 <div class="rad"><span id="stat" class="stat"></span><button id="vack">Väck nyfikenheten</button></div>
+<div id="saga" class="saga" hidden></div>
+<div id="upp" class="upp" hidden></div>
 <ul id="hist"></ul>
 <script>
 const $ = id => document.getElementById(id);
@@ -67,6 +83,47 @@ function matare() {
     : `nyfikenheten växer · nästa fråga om ${Math.floor(kvar / 60)}:${String(kvar % 60).padStart(2, '0')}`;
 }
 
+function sagaHtml() {
+  const g = s.saga;
+  if (!g) return '';
+  const x = g['pågår'] || g.sagor[0];
+  if (!x) return '';
+  const kvar = g['pågår'] ? Math.max(0, Math.round((g['pågår'].slut - Date.now()) / 1000)) : 0;
+  const head = g['pågår']
+    ? `📖 STADENS SAGA NR ${x.nr} <span>skrivs nu · ${Math.floor(kvar / 60)}:${String(kvar % 60).padStart(2, '0')} kvar</span>`
+    : `📖 STADENS SAGA NR ${x.nr} <span>${tid(x.klar || x.ts)}</span>`;
+  const bild = x.bild && x.bild !== 'väntar' ? `<img src="${esc(x.bild)}" alt="">` : '';
+  const rader = (x.rader || []).map(r => `<p>${esc(r.text)} <i>${esc(r['från'])}</i></p>`).join('');
+  const bjud = g['pågår']
+    ? `<div class="bjud">Fortsätt sagan med en mening: svara på inlägget i #${esc(g.kanal)}, eller skicka saga.rad på bussen.</div>`
+    : (x.bild === 'väntar' ? '<div class="bjud">Ateljén målar en bild…</div>' : '');
+  return `<h2>${head}</h2>${bild}<p>${esc(x.text)}</p>${rader}${bjud}`;
+}
+
+function uppHtml() {
+  const u = s.upprop;
+  if (!u) return '';
+  const x = u['pågår'] || u.senaste;
+  if (!x) return '';
+  const svar = new Map(x.svar.map(v => [v.kvarter, v]));
+  const head = u['pågår']
+    ? `ÄR NI VAKNA? <span>upprop ${x.nr} pågår · ${x.svar.length} har svarat</span>`
+    : `ÄR NI VAKNA? <span>upprop ${x.nr} ${tid(x.ts)} · ${x.svar.length} av ${u.kvarter.length} vakna</span>`;
+  const karta = u.kvarter.map(k => {
+    const v = svar.get(k);
+    return v
+      ? `<span class="kv vaken" title="${esc(v.status)}">${esc(k)} <i>${v.ms < 1000 ? v.ms + ' ms' : (v.ms / 1000).toFixed(1) + ' s'}</i></span>`
+      : `<span class="kv">${esc(k)}</span>`;
+  }).join('');
+  const topp = Object.entries(u.topplista).filter(([, t]) => t['bästaMs'] !== null)
+    .sort((a, b) => a[1]['bästaMs'] - b[1]['bästaMs']).slice(0, 3)
+    .map(([k, t], i) => `${['🥇', '🥈', '🥉'][i]} <b>${esc(k)}</b> ${t['bästaMs']} ms`).join(' · ');
+  const status = x.svar.filter(v => v.status).slice(0, 3).map(v => `${esc(v.kvarter)}: ${esc(v.status)}`).join(' · ');
+  return `<h2>${head}</h2><div class="karta">${karta}</div>`
+    + (status ? `<div class="topp">${status}</div>` : '')
+    + (topp ? `<div class="topp">snabbast: ${topp}</div>` : '<div class="topp">Svara på nyfikenhet.ping med nyfikenhet.pong och orsak = pingen.</div>');
+}
+
 async function visa() {
   try {
     s = await fetch('/t/farzad/state', { cache: 'no-store' }).then(r => r.json());
@@ -84,6 +141,12 @@ async function visa() {
     $('stat').innerHTML = `<b>${st['ställda']}</b> ställda · <b>${st.besvarade}</b> besvarade` + (st.snittSvarstidS !== null ? ` · svar på <b>${st.snittSvarstidS} s</b> i snitt` : '');
     $('hist').innerHTML = s.historik.slice(1, 6).map(x =>
       `<li class="hist">${tid(x.ts)} <b>${esc(x.kvarter)}</b> → ${esc(x['fråga'])}${x.svar && x.svar.riktigt ? ' ✓' : ''}${x.kedja ? ` <span class="stat">(genom ${new Set(x.kedja.map(e => e.kvarter)).size} kvarter)</span>` : ''}</li>`).join('');
+    const sh = sagaHtml();
+    $('saga').hidden = !sh || s.paus;
+    if (sh) $('saga').innerHTML = sh;
+    const uh = uppHtml();
+    $('upp').hidden = !uh || s.paus;
+    if (uh) $('upp').innerHTML = uh;
     matare();
   } catch {}
 }
