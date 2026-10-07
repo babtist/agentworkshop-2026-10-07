@@ -3,6 +3,7 @@
 // Lotsen utlöses en gång per fråga (fråga.ny från Örat), av det som först inträffar:
 //   - minne.träff med låg säkerhet (styrka < 50) i frågans kedja (Minnet vet inte)
 //   - svar.granskat med låg styrka (< 60) i frågans kedja (Granskaren underkänner)
+//   - fråga.obesvarad från Örat (ingen har reagerat på 3 min)
 //   - ingen säker träff eller inget svar inom VANTA_MS (ingen svarade alls)
 // Då skickas lots.förslag med orsak = frågan, och Lotsen svarar synligt i frågans tråd.
 //
@@ -88,6 +89,17 @@ function besvarad(handelser, fraga) {
     && rotFraga(handelser, e)?.id === fraga.id);
 }
 
+// Kön (fralle) föreslår mottagare i fråga.prioriterad. Finns ett sådant förslag för frågan går det före vår egen matchning.
+function franKon(ctx, fraga, fragare) {
+  const handelser = ctx.board.events(300);
+  const p = handelser.filter((e) => e.typ === 'fråga.prioriterad' && rotFraga(handelser, e)?.id === fraga.id).pop();
+  if (!p || !p.nyttolast) return null;
+  const lista = [].concat(p.nyttolast.mottagare || p.nyttolast.team || p.nyttolast.förslag || [])
+    .map((x) => String(typeof x === 'object' && x ? (x.team || x.kvarter || '') : x).replace(/^@/, ''));
+  const vem = lista.find((t) => t && t !== ctx.team && t !== fragare && !INTE_KANDIDAT.has(t));
+  return vem ? { agent: vem, inlägg: p.id, kanal: 'kollegan-events', styrka: 85, varför: 'Kön föreslog dem' } : null;
+}
+
 function lotsa(ctx, fraga, utlosare) {
   if (st.hanterade.has(fraga.id)) return;
   st.hanterade.add(fraga.id);
@@ -96,7 +108,7 @@ function lotsa(ctx, fraga, utlosare) {
   const n = fraga.nyttolast || {};
   let fragare = n.frågare;
   if (!fragare && n.inlägg) fragare = (ctx.board.query({ limit: 500 }).find((m) => m.id === n.inlägg) || {}).from;
-  const k = hittaKandidat(ctx.board, ctx.team, n.fråga, fragare);
+  const k = franKon(ctx, fraga, fragare) || hittaKandidat(ctx.board, ctx.team, n.fråga, fragare);
   if (!k) return;
   const r = ctx.board.emit('lots.förslag', {
     styrka: k.styrka,
@@ -134,7 +146,8 @@ module.exports = {
       return;
     }
 
-    const svag = (e.typ === 'minne.träff' && e.styrka !== null && e.styrka < 50)
+    const svag = e.typ === 'fråga.obesvarad'
+      || (e.typ === 'minne.träff' && e.styrka !== null && e.styrka < 50)
       || (e.typ === 'svar.granskat' && e.styrka !== null && e.styrka < 60);
     if (!svag) return;
     const fraga = rotFraga(ctx.board.events(300), e);
